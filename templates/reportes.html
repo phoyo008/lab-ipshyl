@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reportes de Envíos - IPS H&L Salud</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        body { align-items: flex-start; padding: 30px 20px; }
+        .report-container {
+            background: white;
+            border-radius: 14px;
+            box-shadow: 0 8px 40px rgba(26, 92, 168, 0.15);
+            width: 100%;
+            max-width: 1000px;
+            overflow: hidden;
+        }
+        .report-header {
+            background: white;
+            padding: 24px 28px 18px;
+            border-bottom: 3px solid #1a5ca8;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .report-header-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .report-header img {
+            width: 56px;
+            height: 56px;
+            object-fit: contain;
+        }
+        .report-header h1 {
+            font-size: 18px;
+            color: #1a5ca8;
+            font-weight: 700;
+        }
+        .report-header p {
+            font-size: 12px;
+            color: #5a8ac8;
+        }
+        .btn-back {
+            padding: 8px 16px;
+            background: #1a5ca8;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            transition: background 0.2s;
+        }
+        .btn-back:hover { background: #144a8a; }
+
+        .stats-bar {
+            padding: 16px 28px;
+            background: #f0f6ff;
+            border-bottom: 1px solid #c5d9f0;
+            display: flex;
+            gap: 28px;
+            flex-wrap: wrap;
+        }
+        .stat {
+            display: flex;
+            flex-direction: column;
+        }
+        .stat-value {
+            font-size: 22px;
+            font-weight: 700;
+            color: #1a5ca8;
+        }
+        .stat-label {
+            font-size: 11px;
+            color: #5a8ac8;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .table-wrapper { overflow-x: auto; padding: 20px 28px 28px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        thead tr {
+            background: #1a5ca8;
+            color: white;
+        }
+        thead th {
+            padding: 10px 14px;
+            text-align: left;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        tbody tr:nth-child(even) { background: #f0f6ff; }
+        tbody tr:hover { background: #e0ecff; }
+        tbody td {
+            padding: 9px 14px;
+            color: #333;
+            border-bottom: 1px solid #e8eef8;
+        }
+        .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .badge-ok    { background: #dcfce7; color: #16a34a; }
+        .badge-error { background: #fef2f2; color: #dc2626; }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #5a8ac8;
+        }
+        .empty-state p { font-size: 15px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <div class="report-container">
+        <div class="report-header">
+            <div class="report-header-left">
+                <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo">
+                <div>
+                    <h1>Reporte de Envíos</h1>
+                    <p>IPS H&L Salud - Laboratorio</p>
+                </div>
+            </div>
+            <a href="/" class="btn-back">← Volver</a>
+            <a href="/logout" style="position:absolute; top:16px; right:16px; padding:6px 14px; background:transparent; color:#1a5ca8; border:1.5px solid #1a5ca8; border-radius:6px; font-size:12px; font-weight:600; text-decoration:none;">Cerrar sesión</a>
+        </div>
+
+        {% set total     = envios | length %}
+        {% set enviados  = envios | selectattr('estado', 'equalto', 'Enviado') | list | length %}
+        {% set errores   = total - enviados %}
+
+        <div class="stats-bar">
+            <div class="stat">
+                <span class="stat-value">{{ total }}</span>
+                <span class="stat-label">Total registros</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" style="color:#16a34a">{{ enviados }}</span>
+                <span class="stat-label">Enviados OK</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" style="color:#dc2626">{{ errores }}</span>
+                <span class="stat-label">Con error</span>
+            </div>
+        </div>
+
+        <div class="table-wrapper">
+            {% if envios %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Fecha envío</th>
+                        <th>Paciente</th>
+                        <th>Documento</th>
+                        <th>Email</th>
+                        <th>Referencia</th>
+                        <th>Fecha resultado</th>
+                        <th>Estado</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for e in envios %}
+                    <tr>
+                        <td>{{ e['id'] }}</td>
+                        <td style="white-space:nowrap">{{ e['fecha_envio'] }}</td>
+                        <td>{{ e['nombre'] }}</td>
+                        <td>{{ e['documento'] }}</td>
+                        <td>{{ e['email'] }}</td>
+                        <td>{{ e['referencia'] }}</td>
+                        <td>{{ e['fecha_resultado'] }}</td>
+                        <td>
+                            {% if 'Error' in (e['estado'] or '') %}
+                                <span class="badge badge-error">{{ e['estado'] }}</span>
+                            {% else %}
+                                <span class="badge badge-ok">{{ e['estado'] }}</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state">
+                <div style="font-size:40px">📭</div>
+                <p>Aún no hay envíos registrados.</p>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>

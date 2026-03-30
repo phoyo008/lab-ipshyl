@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Envío de Resultados - IPS H&L Salud</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="IPS H&L Salud" class="logo">
+            <h1>Envío de Resultados de Laboratorio</h1>
+            <p>IPS H&L Salud</p>
+            <a href="/logout" class="btn-logout">Cerrar sesión</a>
+        </header>
+
+        <main>
+            <!-- Panel de estado de conexión -->
+            <div class="connection-panel">
+                <div class="connection-header">
+                    <span>Estado de conexiones</span>
+                    <button class="btn-test" id="testBtn" onclick="testConnection()">🔌 Probar</button>
+                </div>
+                <div id="connectionStatus" class="connection-status">
+                    <span class="status-dot neutral"></span>
+                    <span id="statusText">Sin verificar</span>
+                </div>
+                <div id="connectionDetails" class="connection-details hidden"></div>
+            </div>
+
+            <!-- PASO 1: Formulario de carga -->
+            <div class="upload-section" id="uploadSection">
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <div class="input-group">
+                        <label for="pdfFile">Selecciona uno o varios PDFs:</label>
+                        <input type="file" id="pdfFile" name="file" accept=".pdf" multiple required>
+                        <small>Puedes seleccionar varios archivos PDF a la vez (máx. 16 MB c/u)</small>
+                    </div>
+                    <button type="submit" class="btn-submit" id="submitBtn">
+                        🔍 Revisar resultado
+                    </button>
+                </form>
+                <a href="/reportes" class="btn-reportes">📊 Ver reporte de envíos</a>
+            </div>
+
+            <!-- Spinner de carga -->
+            <div id="loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p id="loadingText">Procesando...</p>
+            </div>
+
+            <!-- PASO 2: Vista previa antes de confirmar (múltiples PDFs) -->
+            <div id="previewSection" class="hidden">
+                <div class="preview-header">
+                    <h2>📋 Confirmar envíos</h2>
+                    <p class="preview-subtitle" id="previewSubtitle">Verifica los datos antes de enviar</p>
+                </div>
+                <div id="previewCards"></div>
+                <div class="preview-global-actions">
+                    <button class="btn-confirm" id="confirmAllBtn" onclick="confirmAll()">
+                        📤 Confirmar y enviar todos
+                    </button>
+                    <button class="btn-cancel" onclick="cancelAll()">
+                        ✕ Cancelar todo
+                    </button>
+                </div>
+            </div>
+
+            <!-- PASO 3: Resultados finales -->
+            <div id="result" class="result hidden">
+                <div id="resultContent"></div>
+                <button class="btn-reset" onclick="resetForm()">Enviar otros resultados</button>
+            </div>
+        </main>
+
+        <footer>
+            <p>© 2025 IPS H&L Salud - Automatizador de Resultados</p>
+        </footer>
+    </div>
+
+    <script>
+        const form           = document.getElementById('uploadForm');
+        const fileInput      = document.getElementById('pdfFile');
+        const loading        = document.getElementById('loading');
+        const loadingText    = document.getElementById('loadingText');
+        const result         = document.getElementById('result');
+        const submitBtn      = document.getElementById('submitBtn');
+        const uploadSection  = document.getElementById('uploadSection');
+        const previewSection = document.getElementById('previewSection');
+        const previewCards   = document.getElementById('previewCards');
+
+        // Lista de envíos pendientes: [{token, nombre, documento, email, referencia, fecha}]
+        let pendingItems = [];
+
+        // ---- Test de conexión ----
+        async function testConnection() {
+            const testBtn    = document.getElementById('testBtn');
+            const statusText = document.getElementById('statusText');
+            const statusDot  = document.querySelector('.status-dot');
+            const details    = document.getElementById('connectionDetails');
+
+            testBtn.disabled = true;
+            testBtn.textContent = '⏳ Probando...';
+            statusText.textContent = 'Verificando...';
+            statusDot.className = 'status-dot neutral';
+            details.classList.add('hidden');
+
+            try {
+                const res  = await fetch('/api/test-connection');
+                const data = await res.json();
+
+                details.innerHTML = '';
+                details.classList.remove('hidden');
+
+                const items = [
+                    { key: 'google_sheets', label: '📊 Google Sheets' },
+                    { key: 'email',         label: '📧 Gmail' }
+                ];
+
+                items.forEach(({ key, label }) => {
+                    const r   = data.resultados[key];
+                    const div = document.createElement('div');
+                    div.className = 'conn-item';
+
+                    const icon = document.createElement('span');
+                    icon.textContent = r.ok ? '✅' : '❌';
+
+                    const text = document.createElement('span');
+                    text.className = 'conn-label';
+                    text.textContent = label + ': ';
+
+                    const msg = document.createElement('span');
+                    msg.className = r.ok ? 'conn-ok' : 'conn-err';
+                    msg.textContent = r.mensaje;
+
+                    div.appendChild(icon);
+                    div.appendChild(text);
+                    div.appendChild(msg);
+                    details.appendChild(div);
+                });
+
+                statusDot.className = data.ok ? 'status-dot ok' : 'status-dot error';
+                statusText.textContent = data.ok ? 'Todo conectado' : 'Hay errores de conexión';
+            } catch (e) {
+                statusDot.className = 'status-dot error';
+                statusText.textContent = 'No se pudo conectar al servidor';
+            }
+
+            testBtn.disabled = false;
+            testBtn.textContent = '🔌 Probar';
+        }
+
+        // ---- PASO 1: Subir PDFs y obtener previsualización de cada uno ----
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const files = fileInput.files;
+            if (!files.length) {
+                alert('Por favor selecciona al menos un archivo PDF');
+                return;
+            }
+
+            pendingItems = [];
+            const errors = [];
+
+            submitBtn.disabled = true;
+            uploadSection.classList.add('hidden');
+
+            for (let i = 0; i < files.length; i++) {
+                showLoading(`Procesando archivo ${i + 1} de ${files.length}...`);
+
+                const formData = new FormData();
+                formData.append('file', files[i]);
+
+                try {
+                    const response = await fetch('/api/preview-pdf', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        pendingItems.push(data);
+                    } else {
+                        errors.push({ filename: files[i].name, ...data });
+                    }
+                } catch (err) {
+                    errors.push({ filename: files[i].name, error: 'Error de conexión: ' + err.message });
+                }
+            }
+
+            hideLoading();
+            submitBtn.disabled = false;
+
+            if (pendingItems.length > 0) {
+                showPreview(errors);
+            } else {
+                // Todos fallaron
+                showBatchResult([], errors);
+            }
+        });
+
+        // ---- PASO 2: Mostrar tarjetas de previsualización ----
+        function showPreview(errors) {
+            previewCards.innerHTML = '';
+
+            pendingItems.forEach((item, idx) => {
+                previewCards.appendChild(buildPreviewCard(item, idx));
+            });
+
+            // Mostrar errores de PDFs que no se pudieron procesar
+            errors.forEach(err => {
+                previewCards.appendChild(buildErrorCard(err));
+            });
+
+            const total = pendingItems.length;
+            document.getElementById('previewSubtitle').textContent =
+                total === 1
+                    ? 'Verifica los datos antes de enviar el correo'
+                    : `${total} resultado(s) listos para enviar${errors.length ? `, ${errors.length} con error` : ''}`;
+
+            const confirmAllBtn = document.getElementById('confirmAllBtn');
+            confirmAllBtn.textContent = total === 1
+                ? '📤 Confirmar y enviar'
+                : `📤 Confirmar y enviar todos (${total})`;
+
+            uploadSection.classList.add('hidden');
+            result.classList.add('hidden');
+            previewSection.classList.remove('hidden');
+        }
+
+        function buildPreviewCard(item, idx) {
+            const card = document.createElement('div');
+            card.className = 'preview-box';
+            card.dataset.idx = idx;
+
+            card.innerHTML = '';
+
+            const rows = [
+                ['Paciente',       item.nombre      || '—'],
+                ['Documento',      item.documento    || '—'],
+                ['Referencia',     item.referencia   || '—'],
+                ['Fecha resultado',item.fecha        || '—'],
+            ];
+
+            rows.forEach(([label, value]) => {
+                const field = document.createElement('div');
+                field.className = 'preview-field';
+                const lbl = document.createElement('span');
+                lbl.className = 'preview-label';
+                lbl.textContent = label;
+                const val = document.createElement('span');
+                val.className = 'preview-value';
+                val.textContent = value;
+                field.appendChild(lbl);
+                field.appendChild(val);
+                card.appendChild(field);
+            });
+
+            // Email resaltado
+            const emailField = document.createElement('div');
+            emailField.className = 'preview-field preview-email-field';
+            const emailLabel = document.createElement('span');
+            emailLabel.className = 'preview-label';
+            emailLabel.textContent = '📧 Correo destino';
+            const emailVal = document.createElement('span');
+            emailVal.className = 'preview-value preview-email';
+            emailVal.textContent = item.email || '—';
+            emailField.appendChild(emailLabel);
+            emailField.appendChild(emailVal);
+            card.appendChild(emailField);
+
+            // Botón cancelar este
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'btn-cancel-single';
+            cancelBtn.textContent = '✕ Quitar este';
+            cancelBtn.onclick = () => cancelOne(item.token, card);
+            card.appendChild(cancelBtn);
+
+            return card;
+        }
+
+        function buildErrorCard(err) {
+            const card = document.createElement('div');
+            card.className = 'preview-box preview-box-error';
+
+            const title = document.createElement('p');
+            title.className = 'error-card-title';
+            title.textContent = '❌ ' + (err.filename || 'Archivo');
+            card.appendChild(title);
+
+            const msg = document.createElement('p');
+            msg.className = 'error-card-msg';
+            msg.textContent = err.error || 'No se pudo procesar';
+            card.appendChild(msg);
+
+            return card;
+        }
+
+        // ---- Quitar un PDF individual de la lista ----
+        async function cancelOne(token, cardEl) {
+            fetch('/api/cancel-send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            }).catch(() => {});
+
+            pendingItems = pendingItems.filter(i => i.token !== token);
+            cardEl.remove();
+
+            const total = pendingItems.length;
+            if (total === 0) {
+                resetForm();
+                return;
+            }
+
+            document.getElementById('confirmAllBtn').textContent =
+                total === 1 ? '📤 Confirmar y enviar' : `📤 Confirmar y enviar todos (${total})`;
+            document.getElementById('previewSubtitle').textContent =
+                total === 1 ? 'Verifica los datos antes de enviar el correo'
+                            : `${total} resultado(s) listos para enviar`;
+        }
+
+        // ---- PASO 3: Confirmar y enviar todos ----
+        async function confirmAll() {
+            if (!pendingItems.length) return;
+
+            const confirmAllBtn = document.getElementById('confirmAllBtn');
+            confirmAllBtn.disabled = true;
+            previewSection.classList.add('hidden');
+
+            const successes = [];
+            const errors    = [];
+
+            for (let i = 0; i < pendingItems.length; i++) {
+                showLoading(`Enviando correo ${i + 1} de ${pendingItems.length}...`);
+
+                try {
+                    const response = await fetch('/api/confirm-send', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ token: pendingItems[i].token })
+                    });
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        successes.push(data);
+                    } else {
+                        errors.push({ nombre: pendingItems[i].nombre, ...data });
+                    }
+                } catch (err) {
+                    errors.push({ nombre: pendingItems[i].nombre, error: 'Error de conexión: ' + err.message });
+                }
+            }
+
+            hideLoading();
+            confirmAllBtn.disabled = false;
+            pendingItems = [];
+            showBatchResult(successes, errors);
+        }
+
+        // ---- Cancelar todos ----
+        function cancelAll() {
+            pendingItems.forEach(item => {
+                fetch('/api/cancel-send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: item.token })
+                }).catch(() => {});
+            });
+            pendingItems = [];
+            resetForm();
+        }
+
+        // ---- Mostrar resultado final (puede ser mixto éxitos + errores) ----
+        function showBatchResult(successes, errors) {
+            uploadSection.classList.add('hidden');
+            previewSection.classList.add('hidden');
+            result.classList.remove('hidden');
+
+            const content = document.getElementById('resultContent');
+            content.innerHTML = '';
+
+            successes.forEach(data => {
+                const box = document.createElement('div');
+                box.className = 'success-box';
+                box.style.marginBottom = '12px';
+
+                const title = document.createElement('h2');
+                title.textContent = '✅ Enviado correctamente';
+                box.appendChild(title);
+
+                [['Paciente', data.nombre], ['Email', data.email], ['Documento', data.documento]].forEach(([label, value]) => {
+                    const p = document.createElement('p');
+                    const s = document.createElement('strong');
+                    s.textContent = label + ': ';
+                    p.appendChild(s);
+                    p.appendChild(document.createTextNode(value || ''));
+                    box.appendChild(p);
+                });
+
+                content.appendChild(box);
+            });
+
+            errors.forEach(data => {
+                const box = document.createElement('div');
+                box.className = 'error-box';
+                box.style.marginBottom = '12px';
+
+                const title = document.createElement('h2');
+                title.textContent = '❌ Error';
+                box.appendChild(title);
+
+                const msg = document.createElement('p');
+                const s = document.createElement('strong');
+                s.textContent = 'Mensaje: ';
+                msg.appendChild(s);
+                msg.appendChild(document.createTextNode(data.error || ''));
+                box.appendChild(msg);
+
+                if (data.nombre) {
+                    const p = document.createElement('p');
+                    const s2 = document.createElement('strong');
+                    s2.textContent = 'Paciente: ';
+                    p.appendChild(s2);
+                    p.appendChild(document.createTextNode(data.nombre));
+                    box.appendChild(p);
+                }
+
+                content.appendChild(box);
+            });
+        }
+
+        // ---- Helpers de UI ----
+        function showLoading(msg) {
+            loadingText.textContent = msg || 'Procesando...';
+            loading.classList.remove('hidden');
+        }
+
+        function hideLoading() {
+            loading.classList.add('hidden');
+        }
+
+        function resetForm() {
+            form.reset();
+            pendingItems = [];
+            previewCards.innerHTML = '';
+            previewSection.classList.add('hidden');
+            result.classList.add('hidden');
+            uploadSection.classList.remove('hidden');
+            document.getElementById('confirmAllBtn').disabled = false;
+            fileInput.focus();
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# Credenciales y secretos — NUNCA subir al repositorio
+.env
+clave.json
+
+# Base de datos local
+reportes.db
+
+# Archivos temporales
+uploads/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.DS_Store

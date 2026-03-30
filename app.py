@@ -357,51 +357,85 @@ def mark_sent_in_sheet(sheet_row):
 
 def send_email(to_email, patient_name, referencia, fecha, pdf_path):
     """
-    Envía un correo desde Gmail adjuntando el PDF del resultado.
+    Envía un correo adjuntando el PDF del resultado.
 
-    Usa SMTP con STARTTLS (puerto 587) y App Password de Gmail.
+    Usa SendGrid API si la variable SENDGRID_API_KEY está configurada (producción en Railway).
+    Cae a Gmail SMTP si no está configurada (desarrollo local con App Password).
     Retorna True si el envío fue exitoso, False en caso contrario.
     """
-    try:
-        mensaje = MIMEMultipart()
-        mensaje['From']    = GMAIL_EMAIL
-        mensaje['To']      = to_email
-        mensaje['Subject'] = f'Resultados de laboratorio - Ref: {referencia}'
+    sendgrid_key = os.getenv('SENDGRID_API_KEY')
 
-        # Cuerpo del correo en texto plano
-        cuerpo = f"""Estimado(a) {patient_name},
+    cuerpo = (
+        f"Estimado(a) {patient_name.strip()},\n\n"
+        f"Adjuntamos sus resultados de laboratorio.\n\n"
+        f"REFERENCIA: {referencia}\n"
+        f"FECHA:      {fecha}\n\n"
+        f"Si tiene preguntas sobre sus resultados, por favor contacte a su médico.\n\n"
+        f"Saludos,\n"
+        f"IPS H&L Salud - Laboratorio"
+    )
 
-Adjuntamos sus resultados de laboratorio.
+    if sendgrid_key:
+        # ---- SendGrid (producción en Railway) ----
+        try:
+            import base64
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import (
+                Mail, Attachment, FileContent, FileName, FileType, Disposition
+            )
 
-REFERENCIA: {referencia}
-FECHA:      {fecha}
+            mail = Mail(
+                from_email=GMAIL_EMAIL,
+                to_emails=to_email,
+                subject=f'Resultados de laboratorio - Ref: {referencia}',
+                plain_text_content=cuerpo
+            )
 
-Si tiene preguntas sobre sus resultados, por favor contacte a su médico.
+            with open(pdf_path, 'rb') as f:
+                pdf_data = base64.b64encode(f.read()).decode()
 
-Saludos,
-IPS H&L Salud - Laboratorio
-"""
-        mensaje.attach(MIMEText(cuerpo, 'plain'))
+            attachment = Attachment(
+                file_content=FileContent(pdf_data),
+                file_name=FileName(f'resultado_{referencia}.pdf'),
+                file_type=FileType('application/pdf'),
+                disposition=Disposition('attachment')
+            )
+            mail.attachment = attachment
 
-        # Adjuntar el PDF
-        with open(pdf_path, 'rb') as f:
-            adjunto = MIMEBase('application', 'octet-stream')
-            adjunto.set_payload(f.read())
-        encoders.encode_base64(adjunto)
-        adjunto.add_header('Content-Disposition', f'attachment; filename="resultado_{referencia}.pdf"')
-        mensaje.attach(adjunto)
+            sg = SendGridAPIClient(sendgrid_key)
+            response = sg.send(mail)
+            return response.status_code in (200, 202)
 
-        # Conexión SMTP con Gmail
-        servidor = smtplib.SMTP('smtp.gmail.com', 587)
-        servidor.starttls()
-        servidor.login(GMAIL_EMAIL, GMAIL_PASSWORD)
-        servidor.send_message(mensaje)
-        servidor.quit()
-        return True
+        except Exception as e:
+            print(f"Error enviando email (SendGrid): {e}")
+            return False
 
-    except Exception as e:
-        print(f"Error enviando email: {e}")
-        return False
+    else:
+        # ---- Gmail SMTP (desarrollo local) ----
+        try:
+            mensaje = MIMEMultipart()
+            mensaje['From']    = GMAIL_EMAIL
+            mensaje['To']      = to_email
+            mensaje['Subject'] = f'Resultados de laboratorio - Ref: {referencia}'
+            mensaje.attach(MIMEText(cuerpo, 'plain'))
+
+            with open(pdf_path, 'rb') as f:
+                adjunto = MIMEBase('application', 'octet-stream')
+                adjunto.set_payload(f.read())
+            encoders.encode_base64(adjunto)
+            adjunto.add_header('Content-Disposition', f'attachment; filename="resultado_{referencia}.pdf"')
+            mensaje.attach(adjunto)
+
+            servidor = smtplib.SMTP('smtp.gmail.com', 587)
+            servidor.starttls()
+            servidor.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            servidor.send_message(mensaje)
+            servidor.quit()
+            return True
+
+        except Exception as e:
+            print(f"Error enviando email (SMTP): {e}")
+            return False
 
 
 def log_error(patient_name, documento, error_msg):
@@ -643,15 +677,19 @@ def test_connection():
     except Exception as e:
         results['google_sheets'] = {'ok': False, 'mensaje': str(e)}
 
-    # Prueba Gmail SMTP
+    # Prueba de email: SendGrid (producción) o Gmail SMTP (local)
+    sendgrid_key = os.getenv('SENDGRID_API_KEY')
     try:
-        if not GMAIL_EMAIL or 'tu_correo' in GMAIL_EMAIL:
-            raise ValueError('Credenciales de Gmail no configuradas en .env')
-        servidor = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
-        servidor.starttls()
-        servidor.login(GMAIL_EMAIL, GMAIL_PASSWORD)
-        servidor.quit()
-        results['email'] = {'ok': True, 'mensaje': f'Conectado como {GMAIL_EMAIL}'}
+        if sendgrid_key:
+            results['email'] = {'ok': True, 'mensaje': f'SendGrid configurado. Enviando desde {GMAIL_EMAIL}'}
+        else:
+            if not GMAIL_EMAIL or 'tu_correo' in GMAIL_EMAIL:
+                raise ValueError('Credenciales de Gmail no configuradas en .env')
+            servidor = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
+            servidor.starttls()
+            servidor.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            servidor.quit()
+            results['email'] = {'ok': True, 'mensaje': f'Gmail SMTP conectado como {GMAIL_EMAIL}'}
     except Exception as e:
         results['email'] = {'ok': False, 'mensaje': str(e)}
 

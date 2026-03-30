@@ -323,13 +323,14 @@ def find_email_in_sheets(documento):
 
         if con_email:
             mejor = max(con_email, key=lambda x: x['fecha_dt'])
+            print(f"  → Seleccionada fila {mejor['sheet_row']} (fecha: {mejor['fecha_raw']}, email: {mejor['email']})")
+            return mejor['email'], mejor['sheet_row']
         else:
-            # Ninguna fila tiene email → retornar None
-            print(f"Documento {documento}: ningún registro tiene email.")
-            return None, None
-
-        print(f"  → Seleccionada fila {mejor['sheet_row']} (fecha: {mejor['fecha_raw']}, email: {mejor['email']})")
-        return mejor['email'], mejor['sheet_row']
+            # Paciente encontrado pero ninguna fila tiene email
+            # Retornar la fila más reciente para poder marcar "Sin correo" en el Excel
+            sin_email = max(coincidencias, key=lambda x: x['fecha_dt'])
+            print(f"Documento {documento}: encontrado en fila {sin_email['sheet_row']} pero sin email.")
+            return None, sin_email['sheet_row']
 
     except Exception as e:
         print(f"Error buscando en Google Sheets: {e}")
@@ -357,6 +358,25 @@ def mark_sent_in_sheet(sheet_row):
 
     except Exception as e:
         print(f"Error marcando enviado en sheet: {e}")
+
+
+def mark_no_email_in_sheet(sheet_row):
+    """Marca 'Sin correo' en la columna ENVIADO cuando el paciente no tiene email registrado."""
+    try:
+        client  = get_sheets_client()
+        sheet   = client.open(GOOGLE_SHEET_NAME).sheet1
+        headers = sheet.row_values(2)
+
+        enviado_col = next((i + 1 for i, h in enumerate(headers) if h.strip().upper() == 'ENVIADO'), None)
+
+        if enviado_col is None:
+            print("Columna ENVIADO no encontrada")
+            return
+
+        sheet.update_cell(sheet_row, enviado_col, 'Sin correo')
+
+    except Exception as e:
+        print(f"Error marcando sin correo en sheet: {e}")
 
 
 # ==================== ENVÍO DE EMAIL ====================
@@ -525,12 +545,23 @@ def preview_pdf():
         # Buscar email en Google Sheets (elige la fila con fecha más reciente)
         patient_email, sheet_row = find_email_in_sheets(documento)
         if not patient_email:
-            log_error(nombre, documento, 'Paciente no encontrado o sin email en directorio')
-            return jsonify({
-                'error': 'Paciente no encontrado en el directorio',
-                'nombre': nombre,
-                'documento': documento
-            }), 404
+            if sheet_row:
+                # Paciente encontrado pero sin correo → marcar en el Excel
+                mark_no_email_in_sheet(sheet_row)
+                save_to_db(nombre, documento, '', referencia, fecha, 'Sin correo')
+                return jsonify({
+                    'error': 'El paciente no tiene correo registrado. Se marcó "Sin correo" en el directorio.',
+                    'nombre': nombre,
+                    'documento': documento
+                }), 404
+            else:
+                # Paciente no existe en el directorio
+                log_error(nombre, documento, 'Paciente no encontrado en el directorio')
+                return jsonify({
+                    'error': 'Paciente no encontrado en el directorio',
+                    'nombre': nombre,
+                    'documento': documento
+                }), 404
 
         # Validar formato del email
         if not re.match(r'^[^\s@]+@[^\s@]+\.[^\s@]+$', patient_email):

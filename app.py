@@ -47,9 +47,15 @@ ALLOWED_EXTENSIONS = {'pdf'}
 APP_USERNAME = os.getenv('APP_USERNAME', 'laboratorio')
 APP_PASSWORD = os.getenv('APP_PASSWORD', 'ipshyl2025')
 
-# Credenciales de Gmail (configuradas en .env)
+# Credenciales de correo (configuradas en .env)
 GMAIL_EMAIL    = os.getenv('GMAIL_EMAIL')
 GMAIL_PASSWORD = os.getenv('GMAIL_PASSWORD')
+
+# Servidor SMTP configurable — por defecto Gmail, en Railway usar Brevo u otro
+SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+SMTP_PORT   = int(os.getenv('SMTP_PORT', '587'))
+SMTP_USER   = os.getenv('SMTP_USER', GMAIL_EMAIL)
+SMTP_PASS   = os.getenv('SMTP_PASS', GMAIL_PASSWORD)
 
 # Google Sheets: nombre de la hoja y archivo de credenciales del service account
 GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Directorio_IPS')
@@ -411,7 +417,7 @@ def send_email(to_email, patient_name, referencia, fecha, pdf_path):
             return False
 
     else:
-        # ---- Gmail SMTP (desarrollo local) ----
+        # ---- SMTP genérico (Gmail local, Brevo en Railway, etc.) ----
         try:
             mensaje = MIMEMultipart()
             mensaje['From']    = GMAIL_EMAIL
@@ -426,9 +432,9 @@ def send_email(to_email, patient_name, referencia, fecha, pdf_path):
             adjunto.add_header('Content-Disposition', f'attachment; filename="resultado_{referencia}.pdf"')
             mensaje.attach(adjunto)
 
-            servidor = smtplib.SMTP('smtp.gmail.com', 587)
+            servidor = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
             servidor.starttls()
-            servidor.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            servidor.login(SMTP_USER, SMTP_PASS)
             servidor.send_message(mensaje)
             servidor.quit()
             return True
@@ -683,13 +689,13 @@ def test_connection():
         if sendgrid_key:
             results['email'] = {'ok': True, 'mensaje': f'SendGrid configurado. Enviando desde {GMAIL_EMAIL}'}
         else:
-            if not GMAIL_EMAIL or 'tu_correo' in GMAIL_EMAIL:
-                raise ValueError('Credenciales de Gmail no configuradas en .env')
-            servidor = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
+            if not SMTP_USER:
+                raise ValueError('Credenciales de correo no configuradas')
+            servidor = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
             servidor.starttls()
-            servidor.login(GMAIL_EMAIL, GMAIL_PASSWORD)
+            servidor.login(SMTP_USER, SMTP_PASS)
             servidor.quit()
-            results['email'] = {'ok': True, 'mensaje': f'Gmail SMTP conectado como {GMAIL_EMAIL}'}
+            results['email'] = {'ok': True, 'mensaje': f'SMTP conectado ({SMTP_SERVER}) como {SMTP_USER}'}
     except Exception as e:
         results['email'] = {'ok': False, 'mensaje': str(e)}
 

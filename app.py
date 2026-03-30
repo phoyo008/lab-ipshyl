@@ -365,12 +365,10 @@ def send_email(to_email, patient_name, referencia, fecha, pdf_path):
     """
     Envía un correo adjuntando el PDF del resultado.
 
-    Usa SendGrid API si la variable SENDGRID_API_KEY está configurada (producción en Railway).
+    Usa Brevo API si BREVO_API_KEY está configurada (producción en Railway — HTTPS).
     Cae a Gmail SMTP si no está configurada (desarrollo local con App Password).
     Retorna True si el envío fue exitoso, False en caso contrario.
     """
-    sendgrid_key = os.getenv('SENDGRID_API_KEY')
-
     cuerpo = (
         f"Estimado(a) {patient_name.strip()},\n\n"
         f"Adjuntamos sus resultados de laboratorio.\n\n"
@@ -381,43 +379,39 @@ def send_email(to_email, patient_name, referencia, fecha, pdf_path):
         f"IPS H&L Salud - Laboratorio"
     )
 
-    if sendgrid_key:
-        # ---- SendGrid (producción en Railway) ----
+    brevo_key = os.getenv('BREVO_API_KEY')
+
+    if brevo_key:
+        # ---- Brevo API (producción en Railway — usa HTTPS, no SMTP) ----
         try:
-            import base64
-            from sendgrid import SendGridAPIClient
-            from sendgrid.helpers.mail import (
-                Mail, Attachment, FileContent, FileName, FileType, Disposition
-            )
-
-            mail = Mail(
-                from_email=GMAIL_EMAIL,
-                to_emails=to_email,
-                subject=f'Resultados de laboratorio - Ref: {referencia}',
-                plain_text_content=cuerpo
-            )
-
+            import base64, requests as req
             with open(pdf_path, 'rb') as f:
                 pdf_data = base64.b64encode(f.read()).decode()
 
-            attachment = Attachment(
-                file_content=FileContent(pdf_data),
-                file_name=FileName(f'resultado_{referencia}.pdf'),
-                file_type=FileType('application/pdf'),
-                disposition=Disposition('attachment')
+            payload = {
+                "sender":      {"name": "IPS H&L Salud - Laboratorio", "email": GMAIL_EMAIL},
+                "to":          [{"email": to_email}],
+                "subject":     f"Resultados de laboratorio - Ref: {referencia}",
+                "textContent": cuerpo,
+                "attachment":  [{"content": pdf_data, "name": f"resultado_{referencia}.pdf"}]
+            }
+            response = req.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={"api-key": brevo_key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=15
             )
-            mail.attachment = attachment
-
-            sg = SendGridAPIClient(sendgrid_key)
-            response = sg.send(mail)
-            return response.status_code in (200, 202)
+            if response.status_code == 201:
+                return True
+            print(f"Error Brevo API: {response.status_code} {response.text}")
+            return False
 
         except Exception as e:
-            print(f"Error enviando email (SendGrid): {e}")
+            print(f"Error enviando email (Brevo API): {e}")
             return False
 
     else:
-        # ---- SMTP genérico (Gmail local, Brevo en Railway, etc.) ----
+        # ---- SMTP (Gmail local con App Password) ----
         try:
             mensaje = MIMEMultipart()
             mensaje['From']    = GMAIL_EMAIL
@@ -683,11 +677,17 @@ def test_connection():
     except Exception as e:
         results['google_sheets'] = {'ok': False, 'mensaje': str(e)}
 
-    # Prueba de email: SendGrid (producción) o Gmail SMTP (local)
-    sendgrid_key = os.getenv('SENDGRID_API_KEY')
+    # Prueba de email: Brevo API (producción) o Gmail SMTP (local)
+    brevo_key = os.getenv('BREVO_API_KEY')
     try:
-        if sendgrid_key:
-            results['email'] = {'ok': True, 'mensaje': f'SendGrid configurado. Enviando desde {GMAIL_EMAIL}'}
+        if brevo_key:
+            import requests as req
+            r = req.get('https://api.brevo.com/v3/account',
+                        headers={'api-key': brevo_key}, timeout=10)
+            if r.status_code == 200:
+                results['email'] = {'ok': True, 'mensaje': f'Brevo API conectado. Enviando desde {GMAIL_EMAIL}'}
+            else:
+                raise ValueError(f'Brevo API key inválida: {r.status_code}')
         else:
             if not SMTP_USER:
                 raise ValueError('Credenciales de correo no configuradas')
@@ -695,7 +695,7 @@ def test_connection():
             servidor.starttls()
             servidor.login(SMTP_USER, SMTP_PASS)
             servidor.quit()
-            results['email'] = {'ok': True, 'mensaje': f'SMTP conectado ({SMTP_SERVER}) como {SMTP_USER}'}
+            results['email'] = {'ok': True, 'mensaje': f'Gmail SMTP conectado como {SMTP_USER}'}
     except Exception as e:
         results['email'] = {'ok': False, 'mensaje': str(e)}
 

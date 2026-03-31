@@ -61,8 +61,8 @@ SMTP_PASS   = os.getenv('SMTP_PASS', GMAIL_PASSWORD)
 GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Directorio_IPS')
 CREDENTIALS_FILE  = 'clave.json'
 
-# Base de datos SQLite local para el historial de envíos
-DB_PATH = 'reportes.db'
+# Base de datos SQLite — en producción usa /tmp para garantizar permisos de escritura
+DB_PATH = '/tmp/reportes.db' if os.getenv('FLASK_ENV') != 'development' else 'reportes.db'
 
 
 # ==================== AUTENTICACIÓN ====================

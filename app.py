@@ -797,9 +797,11 @@ def health():
 
 # ==================== INICIO ====================
 
+# Inicializar DB siempre, incluso cuando el servidor arranca via gunicorn
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+init_db()
+
 if __name__ == '__main__':
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    init_db()
     port  = int(os.getenv('PORT', 5001))
     debug = os.getenv('FLASK_ENV') == 'development'
     app.run(debug=debug, host='0.0.0.0', port=port)

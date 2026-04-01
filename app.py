@@ -37,7 +37,7 @@ load_dotenv()
 pending_sends = {}
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'           # Carpeta temporal para PDFs subidos
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads' if os.getenv('FLASK_ENV') != 'development' else 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Límite de 16 MB por archivo
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
 

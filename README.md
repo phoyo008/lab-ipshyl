@@ -1,181 +1,140 @@
-# Automatizador de Resultados de Laboratorio — IPS H&L Salud
+# Lab Results Delivery Automation
 
-Aplicación web en Flask que automatiza el envío de resultados de laboratorio por correo electrónico a los pacientes.
+A Flask web application that automates sending laboratory test results to patients via email. Built for **IPS H&L Salud**, a healthcare clinic in Colombia.
 
-## Cómo funciona
+## What It Does
 
-1. El operario sube el PDF del resultado desde la interfaz web
-2. La app extrae los datos del paciente del PDF (nombre, documento, referencia, fecha)
-3. Busca el email del paciente en Google Sheets por número de documento
-4. Envía el PDF como adjunto al correo del paciente vía Gmail
-5. Marca la fila del paciente como `ENVIADO = Si` en Google Sheets
-6. Guarda un registro del envío en la base de datos local SQLite
+Staff upload a lab result PDF through a simple web interface. The system automatically:
 
-Laboratorios soportados: **SYNLAB** y **COLCAN**
+1. **Extracts patient data** from the PDF using regex-based parsing (name, ID number, reference, date)
+2. **Looks up the patient's email** in a Google Sheets directory by document number
+3. **Previews the delivery** for staff confirmation before sending
+4. **Sends the PDF** as an email attachment via Gmail SMTP or Brevo API
+5. **Marks the delivery** as complete in Google Sheets
+6. **Logs everything** to a local SQLite database for audit
 
----
+Supports batch processing — multiple PDFs can be uploaded and sent at once.
 
-## Estructura del proyecto
+## Supported Lab Formats
+
+| Lab | Name Field | ID Field | Reference | Date Field |
+|-----|-----------|----------|-----------|------------|
+| **SYNLAB** | `NOMBRE:` | `DOCUMENTO: CC.` | `REFERENCIA:` | `FECHA INGRESO:` |
+| **COLCAN** | `Nombre:` | `Idenficacion: CC` | Numeric barcode (10-15 digits) | `Fecha toma muestra:` |
+
+> COLCAN PDFs use a defective font that encodes the letter `t` as a null byte (`\x00`). The parser corrects this automatically.
+
+## Architecture
 
 ```
-automatizacion_ips/
-├── app.py                  # Aplicación principal Flask
-├── clave.json              # Credenciales del service account de Google (NO compartir)
-├── .env                    # Variables de entorno (NO subir a git)
-├── requirements.txt        # Dependencias de Python
-├── reportes.db             # Base de datos SQLite (se genera automáticamente)
-├── uploads/                # Carpeta temporal para PDFs subidos (se limpia automáticamente)
-├── templates/
-│   ├── index.html          # Página principal (formulario de carga)
-│   └── reportes.html       # Historial de envíos
-└── static/
-    ├── style.css           # Estilos globales
-    └── logo.png            # Logo de IPS H&L Salud
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Browser UI  │────▶│  Flask API   │────▶│ Google Sheets│
+│  (upload PDF)│◀────│  (Python)    │◀────│ (patient dir)│
+└─────────────┘     │              │     └──────────────┘
+                    │  ┌────────┐  │     ┌──────────────┐
+                    │  │pdfplumber│ │────▶│  Gmail/Brevo │
+                    │  │(extract)│  │     │  (send email)│
+                    │  └────────┘  │     └──────────────┘
+                    │  ┌────────┐  │
+                    │  │ SQLite  │  │
+                    │  │ (audit) │  │
+                    │  └────────┘  │
+                    └──────────────┘
 ```
 
----
+## Tech Stack
 
-## Requisitos previos
+| Component | Technology |
+|-----------|-----------|
+| Backend | Python 3.12, Flask |
+| PDF parsing | pdfplumber + regex |
+| Patient directory | Google Sheets via gspread |
+| Email delivery | Gmail SMTP or Brevo API |
+| Database | SQLite |
+| Auth | Session-based login |
+| Deployment | Gunicorn, Railway-ready |
 
-- Python 3.9 o superior
-- Cuenta de Gmail con **App Password** habilitada (autenticación en dos pasos requerida)
-- Cuenta de Google Cloud con un **Service Account** y las APIs de Google Sheets y Google Drive activadas
-- El service account debe tener acceso de editor a la hoja de Google Sheets
+## Quick Start
 
----
+### Prerequisites
 
-## Instalación
+- Python 3.9+
+- A Gmail account with [App Password](https://myaccount.google.com/apppasswords) enabled (requires 2-Step Verification)
+- A Google Cloud [Service Account](https://console.cloud.google.com/iam-admin/serviceaccounts) with Sheets and Drive APIs enabled
+
+### Setup
 
 ```bash
-# 1. Crear y activar entorno virtual
-python -m venv venv
-source venv/bin/activate        # macOS / Linux
-venv\Scripts\activate           # Windows
+# Clone the repository
+git clone https://github.com/phoyo008/laboratorio-ipshyl.git
+cd laboratorio-ipshyl
 
-# 2. Instalar dependencias
+# Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate  # macOS/Linux
+# venv\Scripts\activate   # Windows
+
+# Install dependencies
 pip install -r requirements.txt
 
-# 3. Configurar variables de entorno (ver sección siguiente)
+# Configure environment variables
 cp .env.example .env
-# Editar .env con tus credenciales
+# Edit .env with your credentials
 
-# 4. Colocar clave.json en la raíz del proyecto
+# Place your Google service account key as clave.json in the project root
 
-# 5. Iniciar el servidor
+# Start the server
 python app.py
 ```
 
-La app quedará disponible en: `http://localhost:5001`
+The app will be available at `http://localhost:5001`.
 
----
+### Google Sheets Setup
 
-## Configuración (.env)
+The spreadsheet should have this structure:
 
-```env
-# Gmail — usar App Password, no la contraseña normal de la cuenta
-GMAIL_EMAIL=tu_correo@gmail.com
-GMAIL_PASSWORD=xxxx xxxx xxxx xxxx
+| Row 1 | *(internal IDs — ignored)* |
+|-------|---------------------------|
+| **Row 2** | **Marca temporal** | **Numero de documento** | **E-mail resultado** | **ENVIADO** |
+| Row 3+ | `26/02/2026 10:30:00` | `12345678` | `patient@email.com` | |
 
-# Google Sheets — nombre exacto de la hoja (como aparece en Google Drive)
-GOOGLE_SHEET_NAME=NOMBRE_DE_TU_HOJA
+- **Row 2** must contain the column headers
+- The document column must include "numero" and "documento" in its name
+- The email column must include "e-mail" and "resultado" in its name
+- The `ENVIADO` column must be named exactly `ENVIADO`
+- When a patient has multiple rows (repeat visits), the most recent entry is used
 
-# Flask
-FLASK_ENV=development
-SECRET_KEY=cambia_esto_por_una_clave_aleatoria
-PORT=5001
-```
+Share the spreadsheet with the service account email (`...@...iam.gserviceaccount.com`) with **Editor** permissions.
 
-### Cómo obtener el App Password de Gmail
+## API Endpoints
 
-1. Ir a [myaccount.google.com](https://myaccount.google.com)
-2. Seguridad → Verificación en dos pasos (activar si no está activa)
-3. Seguridad → Contraseñas de aplicaciones
-4. Crear una nueva para "Correo" / "Otro (nombre personalizado)"
-5. Copiar la clave de 16 caracteres al `.env`
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/` | Main page — PDF upload form |
+| `GET` | `/reportes` | Delivery history and stats |
+| `POST` | `/api/preview-pdf` | Extract data from PDF, look up patient email |
+| `POST` | `/api/confirm-send` | Send the email (requires preview token) |
+| `POST` | `/api/cancel-send` | Cancel a pending delivery |
+| `GET` | `/api/test-connection` | Test Google Sheets and email connectivity |
+| `GET` | `/api/health` | Health check |
+| `GET` | `/api/debug-sheet` | Show detected sheet headers |
+| `GET` | `/api/debug-search/<id>` | Debug patient lookup by document ID |
 
----
+## Production Deployment
 
-## Configuración de Google Sheets
-
-### Estructura esperada de la hoja
-
-| (fila 1) | IDs internos | ... |
-|---|---|---|
-| (fila 2) | **Marca temporal** | **Número de documento** | **E-mail resultado** | **ENVIADO** | ... |
-| (fila 3+) | 26/02/2026 10:30:00 | 12345678 | paciente@email.com | | ... |
-
-- La fila 1 puede contener cualquier cosa (IDs de formulario, etc.)
-- La fila 2 debe contener los encabezados de columna
-- La columna de fecha preferida es `Marca temporal` (Google Forms la agrega automáticamente). Si no existe, se usa cualquier columna que contenga "fecha" en el nombre
-- La columna de documento debe tener "número" y "documento" en su nombre
-- La columna de email debe tener "e-mail" y "resultado" en su nombre
-- La columna ENVIADO debe llamarse exactamente `ENVIADO`
-
-**Pacientes con múltiples registros:** cuando el mismo número de documento aparece en varias filas (paciente con varias visitas), la app selecciona automáticamente la fila con la fecha más reciente y usa el email de esa fila.
-
-### Cómo configurar el Service Account
-
-1. Ir a [Google Cloud Console](https://console.cloud.google.com)
-2. Crear un proyecto o usar uno existente
-3. Activar las APIs: **Google Sheets API** y **Google Drive API**
-4. Crear credenciales → Cuenta de servicio
-5. Descargar el archivo JSON y guardarlo como `clave.json` en la raíz del proyecto
-6. En Google Sheets, compartir la hoja con el email del service account (`...@...iam.gserviceaccount.com`) con permisos de **Editor**
-
----
-
-## Rutas de la API
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| GET | `/` | Página principal con formulario |
-| GET | `/reportes` | Historial de envíos |
-| POST | `/api/process-pdf` | Procesa y envía un PDF |
-| GET | `/api/test-connection` | Verifica conexión con Sheets y Gmail |
-| GET | `/api/health` | Health check del servidor |
-
----
-
-## Detalles técnicos de extracción PDF
-
-### SYNLAB
-- Nombre: campo `NOMBRE:`
-- Documento: campo `DOCUMENTO: CC.`
-- Referencia: campo `REFERENCIA:`
-- Fecha: campo `FECHA INGRESO:`
-
-### COLCAN
-- Nombre: campo `Nombre:`
-- Documento: campo `Idenficación: CC` *(typo en el PDF original)*
-- Referencia: código de barras numérico de 10-15 dígitos en su propia línea
-- Fecha: campo `Fecha toma muestra:`
-- **Nota:** los PDFs de COLCAN usan una fuente defectuosa que codifica la letra `t` como byte nulo (`\x00`). La app corrige esto automáticamente antes de procesar el texto.
-
----
-
-## Dependencias principales
-
-| Paquete | Uso |
-|---------|-----|
-| Flask | Framework web |
-| pdfplumber | Extracción de texto de PDFs |
-| gspread | Cliente de Google Sheets |
-| google-auth | Autenticación con service account |
-| python-dotenv | Carga de variables de entorno |
-| gunicorn | Servidor WSGI para producción |
-
----
-
-## Producción
-
-Para correr en producción usar gunicorn en lugar del servidor de desarrollo de Flask:
+The app is Railway-ready with the included `Procfile` and `runtime.txt`.
 
 ```bash
-gunicorn -w 2 -b 0.0.0.0:5001 app:app
+# Run with gunicorn
+gunicorn -w 2 -b 0.0.0.0:$PORT app:app
 ```
 
-Cambiar también en `.env`:
-```env
-FLASK_ENV=production
-SECRET_KEY=clave_aleatoria_larga_y_segura
-```
+For production, set these environment variables:
+- `FLASK_ENV=production`
+- `SECRET_KEY` — a long random string
+- `GOOGLE_CREDENTIALS_JSON` — service account JSON (instead of the `clave.json` file)
+- `BREVO_API_KEY` — for email delivery via Brevo instead of Gmail SMTP
+
+## License
+
+MIT

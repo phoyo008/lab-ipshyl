@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Reportes de Envíos - IPS H&L Salud</title>
+    <title>Delivery Report - IPS H&L Salud</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <style>
         body { align-items: flex-start; padding: 30px 20px; }
@@ -130,12 +130,12 @@
             <div class="report-header-left">
                 <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo">
                 <div>
-                    <h1>Reporte de Envíos</h1>
-                    <p>IPS H&L Salud - Laboratorio</p>
+                    <h1>Delivery Report</h1>
+                    <p>IPS H&L Salud - Laboratory</p>
                 </div>
             </div>
-            <a href="/" class="btn-back">← Volver</a>
-            <a href="/logout" style="position:absolute; top:16px; right:16px; padding:6px 14px; background:transparent; color:#1a5ca8; border:1.5px solid #1a5ca8; border-radius:6px; font-size:12px; font-weight:600; text-decoration:none;">Cerrar sesión</a>
+            <a href="/" class="btn-back">&larr; Back</a>
+            <a href="/logout" style="position:absolute; top:16px; right:16px; padding:6px 14px; background:transparent; color:#1a5ca8; border:1.5px solid #1a5ca8; border-radius:6px; font-size:12px; font-weight:600; text-decoration:none;">Log out</a>
         </div>
 
         {% set total     = envios | length %}
@@ -145,15 +145,15 @@
         <div class="stats-bar">
             <div class="stat">
                 <span class="stat-value">{{ total }}</span>
-                <span class="stat-label">Total registros</span>
+                <span class="stat-label">Total records</span>
             </div>
             <div class="stat">
                 <span class="stat-value" style="color:#16a34a">{{ enviados }}</span>
-                <span class="stat-label">Enviados OK</span>
+                <span class="stat-label">Sent OK</span>
             </div>
             <div class="stat">
                 <span class="stat-value" style="color:#dc2626">{{ errores }}</span>
-                <span class="stat-label">Con error</span>
+                <span class="stat-label">Errors</span>
             </div>
         </div>
 
@@ -163,13 +163,13 @@
                 <thead>
                     <tr>
                         <th>#</th>
-                        <th>Fecha envío</th>
-                        <th>Paciente</th>
-                        <th>Documento</th>
+                        <th>Sent at</th>
+                        <th>Patient</th>
+                        <th>Document</th>
                         <th>Email</th>
-                        <th>Referencia</th>
-                        <th>Fecha resultado</th>
-                        <th>Estado</th>
+                        <th>Reference</th>
+                        <th>Result date</th>
+                        <th>Status</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -195,8 +195,8 @@
             </table>
             {% else %}
             <div class="empty-state">
-                <div style="font-size:40px">📭</div>
-                <p>Aún no hay envíos registrados.</p>
+                <div style="font-size:40px">&#x1F4ED;</div>
+                <p>No deliveries recorded yet.</p>
             </div>
             {% endif %}
         </div>

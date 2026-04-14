@@ -1,11 +1,11 @@
-# Credenciales y secretos — NUNCA subir al repositorio
+# Credentials and secrets — NEVER commit
 .env
 clave.json
 
-# Base de datos local
+# Local database
 reportes.db
 
-# Archivos temporales
+# Temporary files
 uploads/
 __pycache__/
 *.pyc

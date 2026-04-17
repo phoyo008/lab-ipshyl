@@ -320,7 +320,9 @@
                             : `${total} result(s) ready to send`;
         }
 
-        // ---- STEP 3: Confirm and send all ----
+        // ---- STEP 3: Confirm and send all in a single batch ----
+        // The backend groups tokens by patient document so multiple PDFs for
+        // the same patient arrive as one email with all attachments.
         async function confirmAll() {
             if (!pendingItems.length) return;
 
@@ -328,28 +330,32 @@
             confirmAllBtn.disabled = true;
             previewSection.classList.add('hidden');
 
-            const successes = [];
-            const errors    = [];
+            const tokens = pendingItems.map(i => i.token);
+            showLoading(
+                pendingItems.length === 1
+                    ? 'Sending email...'
+                    : `Sending ${pendingItems.length} results (grouped by patient)...`
+            );
 
-            for (let i = 0; i < pendingItems.length; i++) {
-                showLoading(`Sending email ${i + 1} of ${pendingItems.length}...`);
+            let successes = [];
+            let errors    = [];
 
-                try {
-                    const response = await fetch('/api/confirm-send', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token: pendingItems[i].token })
-                    });
-                    const data = await response.json();
+            try {
+                const response = await fetch('/api/confirm-send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tokens })
+                });
+                const data = await response.json();
 
-                    if (response.ok) {
-                        successes.push(data);
-                    } else {
-                        errors.push({ nombre: pendingItems[i].nombre, ...data });
-                    }
-                } catch (err) {
-                    errors.push({ nombre: pendingItems[i].nombre, error: 'Connection error: ' + err.message });
+                successes = data.sent_groups || [];
+                errors    = data.errors || [];
+
+                if (!response.ok && !successes.length && !errors.length) {
+                    errors.push({ error: data.error || 'Unknown error' });
                 }
+            } catch (err) {
+                errors.push({ error: 'Connection error: ' + err.message });
             }
 
             hideLoading();
@@ -385,8 +391,11 @@
                 box.className = 'success-box';
                 box.style.marginBottom = '12px';
 
+                const count = data.count || 1;
                 const title = document.createElement('h2');
-                title.textContent = 'Sent successfully';
+                title.textContent = count > 1
+                    ? `Sent successfully (${count} results in one email)`
+                    : 'Sent successfully';
                 box.appendChild(title);
 
                 [['Patient', data.nombre], ['Email', data.email], ['Document', data.documento]].forEach(([label, value]) => {
@@ -397,6 +406,15 @@
                     p.appendChild(document.createTextNode(value || ''));
                     box.appendChild(p);
                 });
+
+                if (Array.isArray(data.referencias) && data.referencias.length) {
+                    const p = document.createElement('p');
+                    const s = document.createElement('strong');
+                    s.textContent = 'References: ';
+                    p.appendChild(s);
+                    p.appendChild(document.createTextNode(data.referencias.join(', ')));
+                    box.appendChild(p);
+                }
 
                 content.appendChild(box);
             });

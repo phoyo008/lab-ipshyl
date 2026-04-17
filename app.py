@@ -27,14 +27,15 @@ from dotenv import load_dotenv
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
-# Temporarily stores pending sends awaiting user confirmation.
-# Key: UUID token  |  Value: dict with filepath, patient data, and timestamp
-pending_sends: dict = {}
+# Pending sends are persisted in SQLite (table `pending_sends`) so that all
+# gunicorn workers share the same state. An in-memory dict would be invisible
+# across workers and cause random "Invalid or expired token" errors when
+# requests are load-balanced to a different process.
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = '/tmp/uploads' if os.getenv('FLASK_ENV') != 'development' else 'uploads'
@@ -61,8 +62,36 @@ SMTP_PASS   = os.getenv('SMTP_PASS', GMAIL_PASSWORD)
 GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Directorio_IPS')
 CREDENTIALS_FILE  = 'clave.json'
 
-# SQLite database — in production uses /tmp for write permissions
-DB_PATH = '/tmp/reportes.db' if os.getenv('FLASK_ENV') != 'development' else 'reportes.db'
+# SQLite database location.
+#
+# On Railway (and most ephemeral container platforms) /tmp is WIPED on every
+# restart, redeploy, or scale event — which means the delivery history would
+# disappear. To persist reports across deploys, mount a Railway Volume (or any
+# persistent disk) and point DATABASE_PATH at a file on that mount, e.g.:
+#
+#     DATABASE_PATH=/data/reportes.db
+#
+# Local development still defaults to a repo-local file. The resolver below
+# falls back to /tmp with a loud warning if nothing is configured, so the app
+# keeps booting even when the volume is not set up yet.
+def _resolve_db_path() -> str:
+    explicit = os.getenv('DATABASE_PATH')
+    if explicit:
+        parent = os.path.dirname(explicit)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return explicit
+    if os.getenv('FLASK_ENV') == 'development':
+        return 'reportes.db'
+    print(
+        "[WARNING] DATABASE_PATH is not set. Falling back to /tmp/reportes.db — "
+        "delivery history WILL BE LOST on restart. "
+        "Mount a Railway Volume at /data and set DATABASE_PATH=/data/reportes.db"
+    )
+    return '/tmp/reportes.db'
+
+
+DB_PATH = _resolve_db_path()
 
 
 # ==================== AUTHENTICATION ====================
@@ -99,7 +128,7 @@ def logout():
 # ==================== DATABASE ====================
 
 def init_db():
-    """Create the 'envios' (deliveries) table if it does not exist. Called at startup."""
+    """Create tables if they do not exist. Called at startup."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS envios (
@@ -113,8 +142,85 @@ def init_db():
             estado        TEXT
         )
     ''')
+    # Pending sends — shared across gunicorn workers
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS pending_sends (
+            token       TEXT PRIMARY KEY,
+            filepath    TEXT NOT NULL,
+            nombre      TEXT,
+            documento   TEXT,
+            email       TEXT,
+            referencia  TEXT,
+            fecha       TEXT,
+            sheet_row   INTEGER,
+            created_at  TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
+
+
+# ==================== PENDING SENDS (shared across workers) ====================
+
+def save_pending_send(token: str, data: dict) -> None:
+    """Persist a pending send to SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        '''INSERT INTO pending_sends
+           (token, filepath, nombre, documento, email, referencia, fecha, sheet_row, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (
+            token,
+            data['filepath'],
+            data.get('nombre'),
+            data.get('documento'),
+            data.get('email'),
+            data.get('referencia'),
+            data.get('fecha'),
+            data.get('sheet_row'),
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def pop_pending_send(token: str) -> dict | None:
+    """Fetch a pending send and remove it atomically. Returns None if not found."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute('SELECT * FROM pending_sends WHERE token = ?', (token,)).fetchone()
+    if row:
+        conn.execute('DELETE FROM pending_sends WHERE token = ?', (token,))
+        conn.commit()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_pending_send(token: str) -> dict | None:
+    """Delete a pending send by token and return its row (for file cleanup)."""
+    return pop_pending_send(token)
+
+
+def cleanup_stale_pending_sends(max_minutes: int = 30) -> None:
+    """Remove pending_sends rows older than max_minutes and delete their files."""
+    cutoff = (datetime.now() - timedelta(minutes=max_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    stale = conn.execute(
+        'SELECT token, filepath FROM pending_sends WHERE created_at < ?',
+        (cutoff,),
+    ).fetchall()
+    conn.execute('DELETE FROM pending_sends WHERE created_at < ?', (cutoff,))
+    conn.commit()
+    conn.close()
+    for r in stale:
+        fp = r['filepath']
+        if fp and os.path.exists(fp):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
 
 
 def save_to_db(nombre, documento, email, referencia, fecha_resultado, estado):
@@ -373,45 +479,86 @@ def mark_no_email_in_sheet(sheet_row):
 
 # ==================== EMAIL SENDING ====================
 
-def send_email(to_email, patient_name, referencia, fecha, pdf_path):
+def _build_email_body(patient_name: str, items: list) -> tuple[str, str]:
     """
-    Send an email with the lab result PDF attached.
+    Build the subject and plain-text body for a lab result email.
+    `items` is a list of dicts with keys: referencia, fecha, pdf_path.
+    Returns (subject, body).
+    """
+    name = patient_name.strip() if patient_name else ''
+    if len(items) == 1:
+        it = items[0]
+        subject = f"Lab Results - Ref: {it['referencia']}"
+        body = (
+            f"Dear {name},\n\n"
+            f"Please find your lab results attached.\n\n"
+            f"REFERENCE: {it['referencia']}\n"
+            f"DATE:      {it['fecha']}\n\n"
+            f"If you have any questions about your results, please contact your physician.\n\n"
+            f"Best regards,\n"
+            f"IPS H&L Salud - Laboratory"
+        )
+        return subject, body
+
+    lines = "\n".join(
+        f"  - Reference: {it['referencia']}  |  Date: {it['fecha']}" for it in items
+    )
+    subject = f"Lab Results - {len(items)} results attached"
+    body = (
+        f"Dear {name},\n\n"
+        f"Please find your {len(items)} lab results attached:\n\n"
+        f"{lines}\n\n"
+        f"If you have any questions about your results, please contact your physician.\n\n"
+        f"Best regards,\n"
+        f"IPS H&L Salud - Laboratory"
+    )
+    return subject, body
+
+
+def send_email(to_email: str, patient_name: str, items: list) -> bool:
+    """
+    Send a single email with one or more lab result PDFs attached.
+
+    `items` is a list of dicts with keys: referencia, fecha, pdf_path.
+    All items in a call are delivered together as attachments on the same
+    message — this lets us group multiple results for one patient into a
+    single email instead of spamming them with one per PDF.
 
     Uses Brevo API if BREVO_API_KEY is configured (production on Railway — HTTPS).
     Falls back to Gmail SMTP if not configured (local development with App Password).
     Returns True if the email was sent successfully, False otherwise.
     """
-    body = (
-        f"Dear {patient_name.strip()},\n\n"
-        f"Please find your lab results attached.\n\n"
-        f"REFERENCE: {referencia}\n"
-        f"DATE:      {fecha}\n\n"
-        f"If you have any questions about your results, please contact your physician.\n\n"
-        f"Best regards,\n"
-        f"IPS H&L Salud - Laboratory"
-    )
+    if not items:
+        return False
 
+    subject, body = _build_email_body(patient_name, items)
     brevo_key = os.getenv('BREVO_API_KEY')
 
     if brevo_key:
         # ---- Brevo API (production on Railway — uses HTTPS, not SMTP) ----
         try:
             import base64, requests as req
-            with open(pdf_path, 'rb') as f:
-                pdf_data = base64.b64encode(f.read()).decode()
+            attachments = []
+            for it in items:
+                with open(it['pdf_path'], 'rb') as f:
+                    pdf_data = base64.b64encode(f.read()).decode()
+                attachments.append({
+                    "content": pdf_data,
+                    "name": f"result_{it['referencia']}.pdf",
+                })
 
             payload = {
                 "sender":      {"name": "IPS H&L Salud - Laboratory", "email": GMAIL_EMAIL},
                 "to":          [{"email": to_email}],
-                "subject":     f"Lab Results - Ref: {referencia}",
+                "subject":     subject,
                 "textContent": body,
-                "attachment":  [{"content": pdf_data, "name": f"result_{referencia}.pdf"}]
+                "attachment":  attachments,
             }
             response = req.post(
                 "https://api.brevo.com/v3/smtp/email",
                 headers={"api-key": brevo_key, "Content-Type": "application/json"},
                 json=payload,
-                timeout=15
+                timeout=30,
             )
             if response.status_code == 201:
                 return True
@@ -422,32 +569,35 @@ def send_email(to_email, patient_name, referencia, fecha, pdf_path):
             print(f"Error sending email (Brevo API): {e}")
             return False
 
-    else:
-        # ---- SMTP (local Gmail with App Password) ----
-        try:
-            message = MIMEMultipart()
-            message['From']    = GMAIL_EMAIL
-            message['To']      = to_email
-            message['Subject'] = f'Lab Results - Ref: {referencia}'
-            message.attach(MIMEText(body, 'plain'))
+    # ---- SMTP (local Gmail with App Password) ----
+    try:
+        message = MIMEMultipart()
+        message['From']    = GMAIL_EMAIL
+        message['To']      = to_email
+        message['Subject'] = subject
+        message.attach(MIMEText(body, 'plain'))
 
-            with open(pdf_path, 'rb') as f:
+        for it in items:
+            with open(it['pdf_path'], 'rb') as f:
                 attachment = MIMEBase('application', 'octet-stream')
                 attachment.set_payload(f.read())
             encoders.encode_base64(attachment)
-            attachment.add_header('Content-Disposition', f'attachment; filename="result_{referencia}.pdf"')
+            attachment.add_header(
+                'Content-Disposition',
+                f'attachment; filename="result_{it["referencia"]}.pdf"',
+            )
             message.attach(attachment)
 
-            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(message)
-            server.quit()
-            return True
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(message)
+        server.quit()
+        return True
 
-        except Exception as e:
-            print(f"Error sending email (SMTP): {e}")
-            return False
+    except Exception as e:
+        print(f"Error sending email (SMTP): {e}")
+        return False
 
 
 def log_error(patient_name, documento, error_msg):
@@ -478,20 +628,6 @@ def reportes():
     return render_template('reportes.html', envios=envios)
 
 
-def _cleanup_stale_pending(max_minutes=30):
-    """Remove pending_sends entries older than max_minutes."""
-    now = datetime.now()
-    stale = [
-        token for token, entry in pending_sends.items()
-        if (now - entry['timestamp']).total_seconds() > max_minutes * 60
-    ]
-    for token in stale:
-        fp = pending_sends[token].get('filepath')
-        if fp and os.path.exists(fp):
-            os.remove(fp)
-        del pending_sends[token]
-
-
 @app.route('/api/preview-pdf', methods=['POST'])
 @login_required
 def preview_pdf():
@@ -505,7 +641,7 @@ def preview_pdf():
     """
     filepath = None
     try:
-        _cleanup_stale_pending()
+        cleanup_stale_pending_sends()
 
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
@@ -556,18 +692,17 @@ def preview_pdf():
             log_error(nombre, documento, f'Invalid email: {patient_email}')
             return jsonify({'error': f'Invalid email: {patient_email}', 'nombre': nombre}), 400
 
-        # Generate token and store pending state in memory
+        # Generate token and persist pending state (shared across workers)
         token = uuid.uuid4().hex
-        pending_sends[token] = {
-            'filepath':  filepath,
-            'nombre':    nombre,
-            'documento': documento,
-            'email':     patient_email,
+        save_pending_send(token, {
+            'filepath':   filepath,
+            'nombre':     nombre,
+            'documento':  documento,
+            'email':      patient_email,
             'referencia': referencia,
-            'fecha':     fecha,
-            'sheet_row': sheet_row,
-            'timestamp': datetime.now()
-        }
+            'fecha':      fecha,
+            'sheet_row':  sheet_row,
+        })
 
         return jsonify({
             'token':     token,
@@ -589,58 +724,110 @@ def preview_pdf():
 def confirm_send():
     """
     STEP 2 of the delivery flow.
-    Receives the token generated by /api/preview-pdf and executes the actual delivery:
-      1. Sends the email with the PDF attached
-      2. Marks ENVIADO=Si in Google Sheets
-      3. Saves a record in SQLite
-      4. Deletes the temporary PDF
+
+    Accepts either:
+      - {"token": "<token>"}       (single delivery, kept for backward compat)
+      - {"tokens": ["<t1>", ...]}  (batch — preferred; groups results by patient
+                                    so multiple PDFs for the same documento are
+                                    attached to a single email)
+
+    For each group (keyed by documento):
+      1. Sends ONE email with all PDFs attached
+      2. Marks ENVIADO=Si in Google Sheets (once per patient)
+      3. Saves a record in SQLite per PDF
+      4. Deletes the temporary PDFs
     """
     try:
-        data  = request.get_json()
-        token = data.get('token') if data else None
+        data = request.get_json() or {}
 
-        if not token or token not in pending_sends:
-            return jsonify({'error': 'Invalid or expired token. Please re-upload the PDF.'}), 400
+        tokens = data.get('tokens')
+        if not tokens:
+            single = data.get('token')
+            tokens = [single] if single else []
 
-        entry = pending_sends.pop(token)
+        if not tokens:
+            return jsonify({'error': 'No tokens provided'}), 400
 
-        filepath   = entry['filepath']
-        nombre     = entry['nombre']
-        documento  = entry['documento']
-        email      = entry['email']
-        referencia = entry['referencia']
-        fecha      = entry['fecha']
-        sheet_row  = entry['sheet_row']
+        # Fetch and remove each pending send. Missing tokens are reported back.
+        entries  = []
+        missing  = []
+        for t in tokens:
+            entry = pop_pending_send(t)
+            if entry:
+                entries.append(entry)
+            else:
+                missing.append(t)
 
-        try:
-            success = send_email(
-                to_email=email,
-                patient_name=nombre,
-                referencia=referencia,
-                fecha=fecha,
-                pdf_path=filepath
-            )
+        if not entries:
+            return jsonify({
+                'error': 'Invalid or expired tokens. Please re-upload the PDFs.',
+                'missing_tokens': missing
+            }), 400
 
-            if success:
+        # Group by documento so each patient receives a single email.
+        groups: dict = {}
+        for e in entries:
+            groups.setdefault(e['documento'], []).append(e)
+
+        sent_groups = []
+        errors      = []
+        files_to_cleanup = [e['filepath'] for e in entries]
+
+        for documento, group in groups.items():
+            email     = group[0]['email']
+            nombre    = group[0]['nombre']
+            sheet_row = group[0]['sheet_row']
+
+            items = [
+                {
+                    'referencia': g['referencia'],
+                    'fecha':      g['fecha'],
+                    'pdf_path':   g['filepath'],
+                }
+                for g in group
+            ]
+
+            ok = send_email(to_email=email, patient_name=nombre, items=items)
+
+            if ok:
                 if sheet_row:
                     mark_sent_in_sheet(sheet_row)
-
-                save_to_db(nombre, documento, email, referencia, fecha, 'Enviado')
-
-                return jsonify({
-                    'success':   True,
-                    'message':   'Email sent successfully',
-                    'nombre':    nombre,
-                    'email':     email,
-                    'documento': documento
-                }), 200
+                for g in group:
+                    save_to_db(g['nombre'], g['documento'], email,
+                               g['referencia'], g['fecha'], 'Enviado')
+                sent_groups.append({
+                    'nombre':      nombre,
+                    'documento':   documento,
+                    'email':       email,
+                    'count':       len(group),
+                    'referencias': [g['referencia'] for g in group],
+                })
             else:
-                log_error(nombre, documento, 'Failed to send email')
-                return jsonify({'error': 'Failed to send email. Check email credentials.'}), 500
+                for g in group:
+                    log_error(g['nombre'], g['documento'], 'Failed to send email')
+                errors.append({
+                    'nombre':    nombre,
+                    'documento': documento,
+                    'email':     email,
+                    'count':     len(group),
+                    'error':     'Failed to send email. Check email credentials.',
+                })
 
-        finally:
-            if filepath and os.path.exists(filepath):
-                os.remove(filepath)
+        # Clean up temp PDFs regardless of outcome
+        for fp in files_to_cleanup:
+            if fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+
+        status_code = 200 if sent_groups else 500
+        return jsonify({
+            'success':      len(errors) == 0 and bool(sent_groups),
+            'sent_groups':  sent_groups,
+            'errors':       errors,
+            'missing_tokens': missing,
+        }), status_code
 
     except Exception as e:
         return jsonify({'error': f'Error: {str(e)}'}), 500
@@ -654,10 +841,15 @@ def cancel_send():
         data  = request.get_json()
         token = data.get('token') if data else None
 
-        if token and token in pending_sends:
-            fp = pending_sends.pop(token).get('filepath')
-            if fp and os.path.exists(fp):
-                os.remove(fp)
+        if token:
+            entry = pop_pending_send(token)
+            if entry:
+                fp = entry.get('filepath')
+                if fp and os.path.exists(fp):
+                    try:
+                        os.remove(fp)
+                    except OSError:
+                        pass
 
         return jsonify({'ok': True}), 200
     except Exception as e:

@@ -13,7 +13,12 @@ Main flow:
 
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 from functools import wraps
+import logging
 import os
 import re
 import uuid
@@ -31,6 +36,14 @@ from datetime import datetime, timedelta
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger('laboratorio-ipshyl')
+
+IS_PRODUCTION = os.getenv('FLASK_ENV') != 'development'
+
 # ==================== CONFIGURATION ====================
 # Pending sends are persisted in SQLite (table `pending_sends`) so that all
 # gunicorn workers share the same state. An in-memory dict would be invisible
@@ -38,11 +51,64 @@ load_dotenv()
 # requests are load-balanced to a different process.
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = '/tmp/uploads' if os.getenv('FLASK_ENV') != 'development' else 'uploads'
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads' if IS_PRODUCTION else 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB file size limit
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
 
+# Session cookies: HttpOnly (block JS access), SameSite=Lax (CSRF mitigation),
+# Secure in production (only sent over HTTPS).
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE']   = IS_PRODUCTION
+
+# Railway terminates TLS and forwards to the app over HTTP. ProxyFix makes
+# request.remote_addr / request.is_secure reflect the real client, which is
+# required for the rate limiter and Talisman to behave correctly.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
+
+# Security headers (HSTS, CSP, frame-options, etc).
+# index.html still ships inline <script> so script-src allows 'unsafe-inline'.
+_CSP = {
+    'default-src': "'self'",
+    'script-src':  ["'self'", "'unsafe-inline'"],
+    'style-src':   ["'self'", "'unsafe-inline'"],
+    'img-src':     ["'self'", 'data:'],
+    'connect-src': "'self'",
+    'frame-ancestors': "'none'",
+    'base-uri':    "'self'",
+    'object-src':  "'none'",
+}
+Talisman(
+    app,
+    force_https=IS_PRODUCTION,
+    strict_transport_security=True,
+    strict_transport_security_max_age=31536000,  # 1 year
+    strict_transport_security_include_subdomains=True,
+    session_cookie_secure=IS_PRODUCTION,
+    session_cookie_http_only=True,
+    content_security_policy=_CSP,
+    referrer_policy='strict-origin-when-cross-origin',
+    frame_options='DENY',
+)
+
+# Rate limiting — abuse/brute-force protection. Storage is per-worker (memory);
+# at clinic scale the effective rate is ~2x what we set (one limiter per
+# gunicorn worker), which is still tight enough to block automated attacks.
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per hour", "30 per minute"],
+    storage_uri="memory://",
+)
+
 ALLOWED_EXTENSIONS = {'pdf'}
+
+# Debug endpoints gate — /api/debug-* leak sheet data, only expose on demand.
+DEBUG_ENDPOINTS_ENABLED = os.getenv('DEBUG_ENDPOINTS', '').lower() in ('true', '1', 'yes')
+
+# Login lockout thresholds.
+LOGIN_MAX_ATTEMPTS    = 5
+LOGIN_LOCKOUT_MINUTES = 15
 
 # Web app login credentials (configured via .env)
 APP_USERNAME = os.getenv('APP_USERNAME', 'laboratorio')
@@ -107,15 +173,38 @@ def login_required(f):
 
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("10 per minute; 30 per hour", methods=['POST'])
 def login():
     error = None
     if request.method == 'POST':
+        ip = get_remote_address() or 'unknown'
+
+        # Lockout check — shared across workers via SQLite
+        locked, minutes_left = is_ip_locked(ip)
+        if locked:
+            logger.warning("Login attempt from locked IP %s (%d min left)", ip, minutes_left)
+            error = f'Too many failed attempts. Try again in {minutes_left} minute(s).'
+            return render_template('login.html', error=error), 429
+
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
+
         if username == APP_USERNAME and password == APP_PASSWORD:
+            reset_login_attempts(ip)
+            session.clear()
             session['logged_in'] = True
+            session.permanent = False
+            logger.info("Successful login from %s (user=%s)", ip, username)
             return redirect(url_for('index'))
-        error = 'Invalid username or password'
+
+        failed = record_failed_login(ip)
+        logger.warning("Failed login from %s (attempt %d/%d, user=%s)",
+                       ip, failed, LOGIN_MAX_ATTEMPTS, username or '<empty>')
+        if failed >= LOGIN_MAX_ATTEMPTS:
+            error = f'Too many failed attempts. Account locked for {LOGIN_LOCKOUT_MINUTES} minutes.'
+        else:
+            remaining = LOGIN_MAX_ATTEMPTS - failed
+            error = f'Invalid username or password. {remaining} attempt(s) remaining.'
     return render_template('login.html', error=error)
 
 
@@ -156,8 +245,87 @@ def init_db():
             created_at  TEXT NOT NULL
         )
     ''')
+    # Login attempts — shared lockout across workers
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            ip            TEXT PRIMARY KEY,
+            failed_count  INTEGER NOT NULL DEFAULT 0,
+            locked_until  TEXT,
+            last_attempt  TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
+
+
+# ==================== LOGIN LOCKOUT (H) ====================
+
+def is_ip_locked(ip: str) -> tuple[bool, int]:
+    """Return (locked, minutes_remaining). Shared across workers via SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        'SELECT locked_until FROM login_attempts WHERE ip = ?', (ip,)
+    ).fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return False, 0
+    try:
+        until = datetime.fromisoformat(row[0])
+    except ValueError:
+        return False, 0
+    if until > datetime.now():
+        remaining = max(1, int((until - datetime.now()).total_seconds() // 60) + 1)
+        return True, remaining
+    return False, 0
+
+
+def record_failed_login(ip: str) -> int:
+    """Increment failed count for ip. Lock the IP once threshold is reached.
+    Returns the new failed count."""
+    now = datetime.now().isoformat(timespec='seconds')
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        'SELECT failed_count FROM login_attempts WHERE ip = ?', (ip,)
+    ).fetchone()
+    if row:
+        new_count = row['failed_count'] + 1
+        locked_until = None
+        if new_count >= LOGIN_MAX_ATTEMPTS:
+            locked_until = (
+                datetime.now() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+            ).isoformat(timespec='seconds')
+        conn.execute(
+            'UPDATE login_attempts SET failed_count = ?, locked_until = ?, last_attempt = ? WHERE ip = ?',
+            (new_count, locked_until, now, ip),
+        )
+    else:
+        new_count = 1
+        conn.execute(
+            'INSERT INTO login_attempts (ip, failed_count, locked_until, last_attempt) VALUES (?, 1, NULL, ?)',
+            (ip, now),
+        )
+    conn.commit()
+    conn.close()
+    return new_count
+
+
+def reset_login_attempts(ip: str) -> None:
+    """Clear lockout state on successful login."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('DELETE FROM login_attempts WHERE ip = ?', (ip,))
+    conn.commit()
+    conn.close()
+
+
+def debug_required(f):
+    """Gate debug endpoints behind the DEBUG_ENDPOINTS env flag (C)."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not DEBUG_ENDPOINTS_ENABLED:
+            return jsonify({'error': 'Not found'}), 404
+        return f(*args, **kwargs)
+    return decorated
 
 
 # ==================== PENDING SENDS (shared across workers) ====================
@@ -630,6 +798,7 @@ def reportes():
 
 @app.route('/api/preview-pdf', methods=['POST'])
 @login_required
+@limiter.limit("60 per minute; 500 per hour")
 def preview_pdf():
     """
     STEP 1 of the delivery flow.
@@ -713,14 +882,19 @@ def preview_pdf():
             'fecha':     fecha
         }), 200
 
-    except Exception as e:
+    except Exception:
+        logger.exception("preview_pdf failed")
         if filepath and os.path.exists(filepath):
-            os.remove(filepath)
-        return jsonify({'error': f'Error: {str(e)}'}), 500
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+        return jsonify({'error': 'Unexpected error processing the PDF. Please try again.'}), 500
 
 
 @app.route('/api/confirm-send', methods=['POST'])
 @login_required
+@limiter.limit("30 per minute; 300 per hour")
 def confirm_send():
     """
     STEP 2 of the delivery flow.
@@ -829,8 +1003,9 @@ def confirm_send():
             'missing_tokens': missing,
         }), status_code
 
-    except Exception as e:
-        return jsonify({'error': f'Error: {str(e)}'}), 500
+    except Exception:
+        logger.exception("confirm_send failed")
+        return jsonify({'error': 'Unexpected error during delivery. Please try again.'}), 500
 
 
 @app.route('/api/cancel-send', methods=['POST'])
@@ -852,8 +1027,9 @@ def cancel_send():
                         pass
 
         return jsonify({'ok': True}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception:
+        logger.exception("cancel_send failed")
+        return jsonify({'error': 'Unexpected error.'}), 500
 
 
 @app.route('/api/test-connection', methods=['GET'])
@@ -910,6 +1086,7 @@ def test_connection():
 
 @app.route('/api/debug-sheet', methods=['GET'])
 @login_required
+@debug_required
 def debug_sheet():
     """Show actual Google Sheet headers for diagnosing column detection issues."""
     try:
@@ -927,6 +1104,7 @@ def debug_sheet():
 
 @app.route('/api/debug-search/<documento>', methods=['GET'])
 @login_required
+@debug_required
 def debug_search(documento):
     """Search for a document ID directly in the sheet and show detected columns and matching rows."""
     try:

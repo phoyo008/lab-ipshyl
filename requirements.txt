@@ -1,4 +1,6 @@
 Flask==2.3.3
+Flask-Limiter==3.5.0
+Flask-Talisman==1.1.0
 pdfplumber==0.9.0
 gspread==5.10.0
 google-auth==2.22.0

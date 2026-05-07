@@ -125,8 +125,11 @@ SMTP_USER   = os.getenv('SMTP_USER', GMAIL_EMAIL)
 SMTP_PASS   = os.getenv('SMTP_PASS', GMAIL_PASSWORD)
 
 # Google Sheets: spreadsheet name and service account credentials file
-GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Directorio_IPS')
-CREDENTIALS_FILE  = 'clave.json'
+GOOGLE_SHEET_NAME      = os.getenv('GOOGLE_SHEET_NAME', 'Directorio_IPS')
+# Worksheet (tab) inside the spreadsheet that holds the form responses.
+# Defaults to the Google Forms response tab; override with GOOGLE_WORKSHEET_NAME if needed.
+GOOGLE_WORKSHEET_NAME  = os.getenv('GOOGLE_WORKSHEET_NAME', 'Respuestas de formulario 1')
+CREDENTIALS_FILE       = 'clave.json'
 
 # SQLite database location.
 #
@@ -439,6 +442,25 @@ def get_sheets_client():
     return gspread.authorize(creds)
 
 
+def get_response_worksheet(client):
+    """
+    Return the worksheet (tab) that holds the Google Forms responses.
+
+    Selects the tab named GOOGLE_WORKSHEET_NAME (e.g. 'Respuestas de formulario 1')
+    instead of relying on .sheet1, which would pick whichever tab happens to be
+    first (e.g. 'tercer trimestre') and miss most of the data.
+    """
+    spreadsheet = client.open(GOOGLE_SHEET_NAME)
+    try:
+        return spreadsheet.worksheet(GOOGLE_WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        print(
+            f"Worksheet '{GOOGLE_WORKSHEET_NAME}' not found in spreadsheet "
+            f"'{GOOGLE_SHEET_NAME}'. Falling back to the first tab."
+        )
+        return spreadsheet.sheet1
+
+
 # ==================== PDF DATA EXTRACTION ====================
 
 def extract_pdf_data(filepath):
@@ -543,7 +565,7 @@ def find_email_in_sheets(documento):
     """
     try:
         client = get_sheets_client()
-        sheet  = client.open(GOOGLE_SHEET_NAME).sheet1
+        sheet  = get_response_worksheet(client)
         rows   = sheet.get_all_values()
 
         # Row 2 (index 1) contains the headers
@@ -610,7 +632,7 @@ def mark_sent_in_sheet(sheet_row):
     """Update the 'ENVIADO' column to 'Si' in the specified Google Sheet row."""
     try:
         client  = get_sheets_client()
-        sheet   = client.open(GOOGLE_SHEET_NAME).sheet1
+        sheet   = get_response_worksheet(client)
         headers = sheet.row_values(2)  # Headers in row 2
 
         # Find the ENVIADO column index (1-based for update_cell)
@@ -630,7 +652,7 @@ def mark_no_email_in_sheet(sheet_row):
     """Mark 'Sin correo' (no email) in the ENVIADO column when the patient has no registered email."""
     try:
         client  = get_sheets_client()
-        sheet   = client.open(GOOGLE_SHEET_NAME).sheet1
+        sheet   = get_response_worksheet(client)
         headers = sheet.row_values(2)
 
         enviado_col = next((i + 1 for i, h in enumerate(headers) if h.strip().upper() == 'ENVIADO'), None)
@@ -1047,7 +1069,7 @@ def test_connection():
     # Test Google Sheets
     try:
         client = get_sheets_client()
-        sheet  = client.open(GOOGLE_SHEET_NAME).sheet1
+        sheet  = get_response_worksheet(client)
         rows   = sheet.get_all_values()
         total  = len(rows) - 2 if len(rows) > 2 else 0  # Subtract ID row and headers
         results['google_sheets'] = {
@@ -1091,7 +1113,7 @@ def debug_sheet():
     """Show actual Google Sheet headers for diagnosing column detection issues."""
     try:
         client  = get_sheets_client()
-        sheet   = client.open(GOOGLE_SHEET_NAME).sheet1
+        sheet   = get_response_worksheet(client)
         rows    = sheet.get_all_values()
         headers = rows[1] if len(rows) > 1 else []
         return jsonify({
@@ -1109,7 +1131,7 @@ def debug_search(documento):
     """Search for a document ID directly in the sheet and show detected columns and matching rows."""
     try:
         client  = get_sheets_client()
-        sheet   = client.open(GOOGLE_SHEET_NAME).sheet1
+        sheet   = get_response_worksheet(client)
         rows    = sheet.get_all_values()
         headers = rows[1] if len(rows) > 1 else []
 
